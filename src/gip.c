@@ -321,6 +321,32 @@ static int is_gip(const unsigned char *cfg, int len)
     return 0;
 }
 
+static void log_interfaces(const unsigned char *cfg, int len)
+{
+    int i = 0, in_interface = 0;
+
+    while (i + 9 <= len) {
+        unsigned blen = cfg[i];
+        if (blen == 0 || i + (int)blen > len) break;
+        if (cfg[i + 1] == UDESC_INTERFACE && blen >= 9) {
+            in_interface = 1;
+            log_line("    interface %u alt %u: %02X:%02X:%02X",
+                     cfg[i + 2], cfg[i + 3], cfg[i + 5], cfg[i + 6], cfg[i + 7]);
+        } else if (cfg[i + 1] == UDESC_ENDPOINT && blen >= 7 && in_interface) {
+            unsigned address = cfg[i + 2];
+            unsigned type = cfg[i + 3] & UE_XFERTYPE;
+            unsigned mps = (unsigned)cfg[i + 4] | ((unsigned)cfg[i + 5] << 8);
+            const char *type_name = type == UE_BULK ? "bulk" :
+                                    type == UE_INTERRUPT ? "interrupt" :
+                                    type == UE_ISOCHRONOUS ? "isochronous" : "control";
+
+            log_line("      endpoint %02X %s %s max-packet %u",
+                     address, address & UE_DIR_IN ? "IN" : "OUT", type_name, mps);
+        }
+        i += (int)blen;
+    }
+}
+
 gip_device *gip_open(char *why, int whylen)
 {
     gip_device *dev = &g_dev;
@@ -341,16 +367,25 @@ gip_device *gip_open(char *why, int whylen)
             fd = open(dev->node, O_RDWR);
             if (fd < 0) continue;
 
-            if (!read_descriptors(fd, cfg, (int)sizeof cfg, &cfg_len) ||
-                !is_gip(cfg, cfg_len)) {
-                close(fd);
-                continue;
-            }
-
             memset(&dd, 0, sizeof dd);
             ioctl(fd, USB_GET_DEVICE_DESC, &dd);
             dev->vendor = word((const unsigned char *)&dd.idVendor);
             dev->product = word((const unsigned char *)&dd.idProduct);
+            log_line("  USB %s %04X:%04X", dev->node, dev->vendor, dev->product);
+
+            if (!read_descriptors(fd, cfg, (int)sizeof cfg, &cfg_len)) {
+                log_line("  USB %s: cannot read configuration descriptors: %s",
+                         dev->node, strerror(errno));
+                close(fd);
+                continue;
+            }
+
+            log_interfaces(cfg, cfg_len);
+
+            if (!is_gip(cfg, cfg_len)) {
+                close(fd);
+                continue;
+            }
 
             dev->fd = fd;
             found = 1;
