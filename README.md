@@ -112,16 +112,22 @@ claimed.
 
 ### Xbox Wireless Adapter
 
-The Xbox Wireless Adapter (`045E:02FE`) is detected and reported in the log, but
-is **not supported yet**. The adapter uses a separate MediaTek-based wireless
-transport; it does not expose the controller as a GIP USB interface. Wireless
-support requires adapter firmware loading, radio initialization, pairing, and
-forwarding the received controller packets into the GIP input path.
+The Xbox Wireless Adapter (`045E:02FE`) is detected. With the local firmware
+file present, the payload now attempts to upload the adapter firmware over USB.
+This is only the first initialization stage: radio setup, pairing, and
+forwarding controller packets into the GIP input path are **not implemented**,
+so the controller will not yet work wirelessly.
 
 When the locally supplied `FW_ACC_00U.bin` is present in the project root,
 the build verifies its SHA-256 and embeds it in the payload. The firmware is
-ignored by Git and is not included in source releases. This only prepares the
-firmware for the adapter driver; it does not enable wireless support by itself.
+ignored by Git and is not included in source releases.
+
+The adapter upload path logs its USB setup, firmware chunk addresses, DMA
+register values, and bulk-transfer completion details to
+`/data/fgg-xsense/xsense.log`. This diagnostic path performs the normal
+firmware upload; it does not send additional test payloads. If the initial
+adapter register read fails, it also probes the standard USB device descriptor
+to distinguish a general control-endpoint problem from a vendor-request issue.
 
 Developed and verified against a GameSir pad (`3537:1010`) on firmware
 **11.60**.

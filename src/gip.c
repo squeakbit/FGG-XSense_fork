@@ -1,5 +1,6 @@
 #include "gip.h"
 #include "log.h"
+#include "xbox_adapter.h"
 
 #include <sys/ioctl.h>
 #include <sys/types.h>
@@ -403,10 +404,14 @@ gip_device *gip_open(char *why, int whylen)
 
     if (!found) {
         if (wireless_node[0] != '\0') {
-            snprintf(why, (size_t)whylen,
-                     "Xbox Wireless Adapter detected at %s; wireless adapter "
-                     "support is not implemented yet",
+            char adapter_why[256];
+
+            log_line("  Xbox Wireless Adapter at %s: loading firmware",
                      wireless_node);
+            xbox_adapter_load_firmware(wireless_node, adapter_why,
+                                       sizeof adapter_why);
+            snprintf(why, (size_t)whylen, "%s: %s",
+                     wireless_node, adapter_why);
         } else {
             snprintf(why, (size_t)whylen,
                      "no Xbox-protocol controller connected");

@@ -20,11 +20,12 @@ CFLAGS := -std=c11 -Wall -Wextra -Werror -O2 -Isrc
 # No libScePad: the host process has not loaded it, so calls into the module
 # fault. The ioctls it wraps are issued directly instead.
 
-SRCS := src/main.c src/gip.c src/vpad.c src/log.c
+SRCS := src/main.c src/gip.c src/vpad.c src/log.c src/xbox_adapter.c
 OBJS := $(patsubst %.c,$(BUILD)/%.o,$(SRCS))
 
 FIRMWARE := FW_ACC_00U.bin
 ifneq ($(wildcard $(FIRMWARE)),)
+CFLAGS += -DHAS_XBOX_WIRELESS_FIRMWARE
 OBJS += $(BUILD)/firmware_blob.o
 endif
 

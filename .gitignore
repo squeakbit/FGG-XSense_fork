@@ -1,6 +1,7 @@
 # Build output
 build/
 *.elf
+*.pcapng
 *.o
 *.a
 FW_ACC_00U.bin
