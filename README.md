@@ -124,10 +124,22 @@ ignored by Git and is not included in source releases.
 
 The adapter upload path logs its USB setup, firmware chunk addresses, DMA
 register values, and bulk-transfer completion details to
-`/data/fgg-xsense/xsense.log`. This diagnostic path performs the normal
-firmware upload; it does not send additional test payloads. If the initial
-adapter register read fails, it also probes the standard USB device descriptor
-to distinguish a general control-endpoint problem from a vendor-request issue.
+`/data/fgg-xsense/xsense.log`. Immediately before the first bulk OUT, it queues
+bulk IN receives on adapter endpoints `0x85` and `0x84`; received data is
+logged and drained while waiting for bulk OUT. This diagnostic path performs
+the normal firmware upload; it does not send additional test payloads. If the
+initial adapter register read fails, it also probes the standard USB device
+descriptor to distinguish a general control-endpoint problem from a
+vendor-request issue.
+
+For USB troubleshooting without attempting a firmware upload, build the
+separate read-only diagnostic payload with `make adapter-diagnostic`. It reads
+the USB descriptors and adapter DMA registers before and after interface claim,
+USB transfer initialization, and each endpoint open/close. It opens bulk OUT
+endpoints `0x04` and `0x09` without starting a transfer. Deploy it with
+`make test-adapter-diagnostic`; its results are logged to
+`/data/fgg-xsense/xsense.log`. This target uses separate build objects and does
+not replace `fgg-xsense.elf`.
 
 Developed and verified against a GameSir pad (`3537:1010`) on firmware
 **11.60**.

@@ -1,6 +1,7 @@
 #include "gip.h"
 #include "log.h"
 #include "xbox_adapter.h"
+#include "xbox_adapter_diag.h"
 
 #include <sys/ioctl.h>
 #include <sys/types.h>
@@ -406,10 +407,17 @@ gip_device *gip_open(char *why, int whylen)
         if (wireless_node[0] != '\0') {
             char adapter_why[256];
 
+#ifdef XBOX_ADAPTER_READ_ONLY_DIAGNOSTIC
+            log_line("  Xbox Wireless Adapter at %s: read-only diagnostics",
+                     wireless_node);
+            xbox_adapter_run_diagnostics(wireless_node, adapter_why,
+                                         sizeof adapter_why);
+#else
             log_line("  Xbox Wireless Adapter at %s: loading firmware",
                      wireless_node);
             xbox_adapter_load_firmware(wireless_node, adapter_why,
                                        sizeof adapter_why);
+#endif
             snprintf(why, (size_t)whylen, "%s: %s",
                      wireless_node, adapter_why);
         } else {

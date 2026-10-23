@@ -213,7 +213,11 @@ int main(void)
     if (!log_open(STATE_DIR, LOG_PATH)) return 1;
 
     log_line("========================================");
+#ifdef XBOX_ADAPTER_READ_ONLY_DIAGNOSTIC
+    log_line("Xbox Wireless Adapter read-only diagnostics");
+#else
     log_line("FGG-XSense -- Xbox controller on PlayStation 5");
+#endif
 
     if (!lock_take()) {
         log_line("  another copy is already running -- exiting");

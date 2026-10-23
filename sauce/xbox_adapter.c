@@ -20,8 +20,13 @@
 
 #ifdef HAS_XBOX_WIRELESS_FIRMWARE
 #define XBOX_ADAPTER_BULK_OUT  0x04
-#define XBOX_ADAPTER_EP_INDEX  0
+#define XBOX_ADAPTER_BULK_IN_WLAN 0x84
+#define XBOX_ADAPTER_BULK_IN_CMD  0x85
+#define XBOX_ADAPTER_EP_OUT_INDEX 0
+#define XBOX_ADAPTER_EP_IN_CMD_INDEX 1
+#define XBOX_ADAPTER_EP_IN_WLAN_INDEX 2
 #define XBOX_ADAPTER_INTERFACE 0
+#define XBOX_ADAPTER_IN_BUFFER_SIZE 512
 
 #define MT_REQ_DEV_MODE  0x01
 #define MT_REQ_WRITE_CFG 0x46
@@ -41,25 +46,27 @@
 #define MT_FW_LOAD_IVB  0x12
 #define MT_MCU_ILM_OFFSET 0x00080000u
 #define MT_MCU_DLM_OFFSET 0x00110800u
-#define MT_FW_CHUNK_SIZE 0x3800u
+#define MT_FW_CHUNK_SIZE 0x1000u
 #define MT_DMA_COMPLETE 0xc0000000u
 
 #define XFER_TIMEOUT_MS 2000
 #define POLL_TIMEOUT_MS 1000
 #define POLL_INTERVAL_US 1000
-#define USB_FS_INDEX_COUNT 1
+#define USB_FS_INDEX_COUNT 3
 
 typedef struct {
     int fd;
     char operation[128];
-    struct usb_fs_endpoint endpoint;
-    void *buffer_pointer[1];
-    uint32_t buffer_length[1];
+    struct usb_fs_endpoint endpoints[USB_FS_INDEX_COUNT];
+    void *buffer_pointer[USB_FS_INDEX_COUNT][1];
+    uint32_t buffer_length[USB_FS_INDEX_COUNT][1];
     unsigned char buffer[4 + MT_FW_CHUNK_SIZE + 4];
+    unsigned char input_buffers[2][XBOX_ADAPTER_IN_BUFFER_SIZE];
     uint16_t endpoint_max_packet_length;
     uint32_t endpoint_max_bufsize;
     int fs_initialized;
     int interface_claimed;
+    int input_receives_started;
 } adapter_transport;
 
 static void set_operation(adapter_transport *dev, const char *operation)
@@ -221,20 +228,41 @@ static int bulk_write(adapter_transport *dev, const unsigned char *data,
     struct usb_fs_complete complete;
     struct usb_device_stats stats_before, stats_after;
     int have_stats_before, have_stats_after;
-    int waited, polls = 0, completions = 0, unrelated_completions = 0;
+    int waited, polls = 0, completions = 0, input_completions = 0;
+
+    if (!dev->input_receives_started) {
+        uint8_t indexes[] = {
+            XBOX_ADAPTER_EP_IN_CMD_INDEX,
+            XBOX_ADAPTER_EP_IN_WLAN_INDEX
+        };
+        size_t i;
+
+        for (i = 0; i < sizeof indexes / sizeof indexes[0]; i++) {
+            memset(&start, 0, sizeof start);
+            start.ep_index = indexes[i];
+            set_operation(dev, i == 0 ?
+                          "starting USB bulk IN endpoint 0x85" :
+                          "starting USB bulk IN endpoint 0x84");
+            if (ioctl(dev->fd, USB_FS_START, &start) != 0)
+                return log_ioctl_failure(dev, "USB_FS_START (bulk IN)");
+        }
+        dev->input_receives_started = 1;
+        log_line("  adapter bulk IN receives queued on endpoints 0x85 and "
+                 "0x84");
+    }
 
     have_stats_before = get_device_stats(dev, &stats_before);
-    dev->buffer_pointer[0] = (void *)data;
-    dev->buffer_length[0] = length;
-    dev->endpoint.nFrames = 1;
-    dev->endpoint.aFrames = 0;
-    dev->endpoint.status = 0;
-    dev->endpoint.timeout = XFER_TIMEOUT_MS;
+    dev->buffer_pointer[XBOX_ADAPTER_EP_OUT_INDEX][0] = (void *)data;
+    dev->buffer_length[XBOX_ADAPTER_EP_OUT_INDEX][0] = length;
+    dev->endpoints[XBOX_ADAPTER_EP_OUT_INDEX].nFrames = 1;
+    dev->endpoints[XBOX_ADAPTER_EP_OUT_INDEX].aFrames = 0;
+    dev->endpoints[XBOX_ADAPTER_EP_OUT_INDEX].status = 0;
+    dev->endpoints[XBOX_ADAPTER_EP_OUT_INDEX].timeout = XFER_TIMEOUT_MS;
 
     snprintf(dev->operation, sizeof dev->operation,
              "bulk OUT transfer of %u bytes", length);
     memset(&start, 0, sizeof start);
-    start.ep_index = XBOX_ADAPTER_EP_INDEX;
+    start.ep_index = XBOX_ADAPTER_EP_OUT_INDEX;
     if (ioctl(dev->fd, USB_FS_START, &start) != 0)
         return log_ioctl_failure(dev, "USB_FS_START");
 
@@ -243,20 +271,60 @@ static int bulk_write(adapter_transport *dev, const unsigned char *data,
         memset(&complete, 0, sizeof complete);
         if (ioctl(dev->fd, USB_FS_COMPLETE, &complete) == 0) {
             completions++;
-            if (complete.ep_index != XBOX_ADAPTER_EP_INDEX) {
-                unrelated_completions++;
+            if (complete.ep_index != XBOX_ADAPTER_EP_OUT_INDEX) {
+                int input_index;
+
+                input_completions++;
+                if (complete.ep_index == XBOX_ADAPTER_EP_IN_CMD_INDEX)
+                    input_index = 0;
+                else if (complete.ep_index == XBOX_ADAPTER_EP_IN_WLAN_INDEX)
+                    input_index = 1;
+                else
+                    continue;
+
+                if (dev->endpoints[complete.ep_index].status == 0 &&
+                    dev->endpoints[complete.ep_index].aFrames != 0) {
+                    log_line("  adapter USB bulk IN EP 0x%02x received "
+                             "%u byte(s)",
+                             input_index == 0 ? XBOX_ADAPTER_BULK_IN_CMD :
+                                                XBOX_ADAPTER_BULK_IN_WLAN,
+                             dev->buffer_length[complete.ep_index][0]);
+                } else if (dev->endpoints[complete.ep_index].status != 0) {
+                    log_line("  adapter USB bulk IN EP 0x%02x completed "
+                             "with status %d (%s)",
+                             input_index == 0 ? XBOX_ADAPTER_BULK_IN_CMD :
+                                                XBOX_ADAPTER_BULK_IN_WLAN,
+                             dev->endpoints[complete.ep_index].status,
+                             usb_status_name(
+                                 dev->endpoints[complete.ep_index].status));
+                }
+
+                dev->buffer_pointer[complete.ep_index][0] =
+                    dev->input_buffers[input_index];
+                dev->buffer_length[complete.ep_index][0] =
+                    sizeof dev->input_buffers[input_index];
+                dev->endpoints[complete.ep_index].nFrames = 1;
+                dev->endpoints[complete.ep_index].aFrames = 0;
+                dev->endpoints[complete.ep_index].status = 0;
+                memset(&start, 0, sizeof start);
+                start.ep_index = complete.ep_index;
+                if (ioctl(dev->fd, USB_FS_START, &start) != 0)
+                    return log_ioctl_failure(dev, "USB_FS_START (bulk IN)");
+                usleep(POLL_INTERVAL_US);
                 continue;
             }
             have_stats_after = get_device_stats(dev, &stats_after);
-            if (dev->endpoint.status == 0 &&
-                dev->endpoint.aFrames == 1 &&
-                dev->buffer_length[0] == length) {
+            if (dev->endpoints[XBOX_ADAPTER_EP_OUT_INDEX].status == 0 &&
+                dev->endpoints[XBOX_ADAPTER_EP_OUT_INDEX].aFrames == 1 &&
+                dev->buffer_length[XBOX_ADAPTER_EP_OUT_INDEX][0] == length) {
                 log_line("  adapter USB bulk OUT completed: %u bytes, "
                          "%d ms, %d poll(s), %d completion(s)",
-                         dev->buffer_length[0], waited + 1, polls,
+                         dev->buffer_length[XBOX_ADAPTER_EP_OUT_INDEX][0],
+                         waited + 1, polls,
                          completions);
                 if (have_stats_before && have_stats_after) {
-                    log_line("  adapter USB bulk stats: +ok %u, +fail %u",
+                    log_line("  adapter USB bulk endpoint stats (IN+OUT): "
+                             "+ok %u, +fail %u",
                              stats_after.uds_requests_ok[UE_BULK] -
                                  stats_before.uds_requests_ok[UE_BULK],
                              stats_after.uds_requests_fail[UE_BULK] -
@@ -267,17 +335,22 @@ static int bulk_write(adapter_transport *dev, const unsigned char *data,
             log_line("  adapter USB bulk OUT completion: requested %u bytes, "
                      "reported frame length %u, status %d (%s), "
                      "completed frames %u, "
-                     "polls %d, completions %d, unrelated completions %d, "
+                     "polls %d, completions %d, IN completions %d, "
                      "max packet %u, "
                      "max buffer %u",
-                     length, dev->buffer_length[0], dev->endpoint.status,
-                     usb_status_name(dev->endpoint.status),
-                     dev->endpoint.aFrames, polls, completions,
-                     unrelated_completions,
+                     length,
+                     dev->buffer_length[XBOX_ADAPTER_EP_OUT_INDEX][0],
+                     dev->endpoints[XBOX_ADAPTER_EP_OUT_INDEX].status,
+                     usb_status_name(
+                         dev->endpoints[XBOX_ADAPTER_EP_OUT_INDEX].status),
+                     dev->endpoints[XBOX_ADAPTER_EP_OUT_INDEX].aFrames,
+                     polls, completions,
+                     input_completions,
                      dev->endpoint_max_packet_length,
                      dev->endpoint_max_bufsize);
             if (have_stats_before && have_stats_after) {
-                log_line("  adapter USB bulk stats: +ok %u, +fail %u",
+                log_line("  adapter USB bulk endpoint stats (IN+OUT): "
+                         "+ok %u, +fail %u",
                          stats_after.uds_requests_ok[UE_BULK] -
                              stats_before.uds_requests_ok[UE_BULK],
                          stats_after.uds_requests_fail[UE_BULK] -
@@ -288,7 +361,7 @@ static int bulk_write(adapter_transport *dev, const unsigned char *data,
             }
             snprintf(dev->operation, sizeof dev->operation,
                      "bulk OUT transfer failed (USB status %d)",
-                     dev->endpoint.status);
+                     dev->endpoints[XBOX_ADAPTER_EP_OUT_INDEX].status);
             errno = EIO;
             return 0;
         }
@@ -299,13 +372,15 @@ static int bulk_write(adapter_transport *dev, const unsigned char *data,
     }
 
     log_line("  adapter USB_FS_COMPLETE timed out after %d ms; "
-             "%d poll(s), %d completion(s), %d unrelated completion(s), "
+             "%d poll(s), %d completion(s), %d IN completion(s), "
              "frame status %d (%s), completed frames %u, "
              "reported frame length %u",
-             XFER_TIMEOUT_MS, polls, completions, unrelated_completions,
-             dev->endpoint.status,
-             usb_status_name(dev->endpoint.status),
-             dev->endpoint.aFrames, dev->buffer_length[0]);
+             XFER_TIMEOUT_MS, polls, completions, input_completions,
+             dev->endpoints[XBOX_ADAPTER_EP_OUT_INDEX].status,
+             usb_status_name(
+                 dev->endpoints[XBOX_ADAPTER_EP_OUT_INDEX].status),
+             dev->endpoints[XBOX_ADAPTER_EP_OUT_INDEX].aFrames,
+             dev->buffer_length[XBOX_ADAPTER_EP_OUT_INDEX][0]);
     errno = ETIMEDOUT;
     return 0;
 }
@@ -363,16 +438,47 @@ static int open_transport(adapter_transport *dev, const char *node)
         log_line("  adapter USB interface 0 claimed");
     }
 
-    dev->buffer_pointer[0] = dev->buffer;
-    dev->buffer_length[0] = sizeof dev->buffer;
-    dev->endpoint.ppBuffer = dev->buffer_pointer;
-    dev->endpoint.pLength = dev->buffer_length;
-    dev->endpoint.nFrames = 1;
-    dev->endpoint.flags = USB_FS_FLAG_SINGLE_SHORT_OK;
-    dev->endpoint.timeout = XFER_TIMEOUT_MS;
+    dev->buffer_pointer[XBOX_ADAPTER_EP_OUT_INDEX][0] = dev->buffer;
+    dev->buffer_length[XBOX_ADAPTER_EP_OUT_INDEX][0] = sizeof dev->buffer;
+    dev->endpoints[XBOX_ADAPTER_EP_OUT_INDEX].ppBuffer =
+        dev->buffer_pointer[XBOX_ADAPTER_EP_OUT_INDEX];
+    dev->endpoints[XBOX_ADAPTER_EP_OUT_INDEX].pLength =
+        dev->buffer_length[XBOX_ADAPTER_EP_OUT_INDEX];
+    dev->endpoints[XBOX_ADAPTER_EP_OUT_INDEX].nFrames = 1;
+    dev->endpoints[XBOX_ADAPTER_EP_OUT_INDEX].flags =
+        USB_FS_FLAG_SINGLE_SHORT_OK;
+    dev->endpoints[XBOX_ADAPTER_EP_OUT_INDEX].timeout = XFER_TIMEOUT_MS;
+
+    dev->buffer_pointer[XBOX_ADAPTER_EP_IN_CMD_INDEX][0] =
+        dev->input_buffers[0];
+    dev->buffer_length[XBOX_ADAPTER_EP_IN_CMD_INDEX][0] =
+        sizeof dev->input_buffers[0];
+    dev->endpoints[XBOX_ADAPTER_EP_IN_CMD_INDEX].ppBuffer =
+        dev->buffer_pointer[XBOX_ADAPTER_EP_IN_CMD_INDEX];
+    dev->endpoints[XBOX_ADAPTER_EP_IN_CMD_INDEX].pLength =
+        dev->buffer_length[XBOX_ADAPTER_EP_IN_CMD_INDEX];
+    dev->endpoints[XBOX_ADAPTER_EP_IN_CMD_INDEX].nFrames = 1;
+    dev->endpoints[XBOX_ADAPTER_EP_IN_CMD_INDEX].flags =
+        USB_FS_FLAG_SINGLE_SHORT_OK;
+    dev->endpoints[XBOX_ADAPTER_EP_IN_CMD_INDEX].timeout =
+        USB_FS_TIMEOUT_NONE;
+
+    dev->buffer_pointer[XBOX_ADAPTER_EP_IN_WLAN_INDEX][0] =
+        dev->input_buffers[1];
+    dev->buffer_length[XBOX_ADAPTER_EP_IN_WLAN_INDEX][0] =
+        sizeof dev->input_buffers[1];
+    dev->endpoints[XBOX_ADAPTER_EP_IN_WLAN_INDEX].ppBuffer =
+        dev->buffer_pointer[XBOX_ADAPTER_EP_IN_WLAN_INDEX];
+    dev->endpoints[XBOX_ADAPTER_EP_IN_WLAN_INDEX].pLength =
+        dev->buffer_length[XBOX_ADAPTER_EP_IN_WLAN_INDEX];
+    dev->endpoints[XBOX_ADAPTER_EP_IN_WLAN_INDEX].nFrames = 1;
+    dev->endpoints[XBOX_ADAPTER_EP_IN_WLAN_INDEX].flags =
+        USB_FS_FLAG_SINGLE_SHORT_OK;
+    dev->endpoints[XBOX_ADAPTER_EP_IN_WLAN_INDEX].timeout =
+        USB_FS_TIMEOUT_NONE;
 
     memset(&init, 0, sizeof init);
-    init.pEndpoints = &dev->endpoint;
+    init.pEndpoints = dev->endpoints;
     init.ep_index_max = USB_FS_INDEX_COUNT;
     set_operation(dev, "initializing USB transfer");
     if (ioctl(dev->fd, USB_FS_INIT, &init) != 0)
@@ -382,7 +488,7 @@ static int open_transport(adapter_transport *dev, const char *node)
     memset(&endpoint, 0, sizeof endpoint);
     endpoint.max_bufsize = sizeof dev->buffer;
     endpoint.max_frames = 1;
-    endpoint.ep_index = XBOX_ADAPTER_EP_INDEX;
+    endpoint.ep_index = XBOX_ADAPTER_EP_OUT_INDEX;
     endpoint.ep_no = XBOX_ADAPTER_BULK_OUT;
     set_operation(dev, "opening USB bulk endpoint 0x04");
     if (ioctl(dev->fd, USB_FS_OPEN, &endpoint) != 0)
@@ -392,6 +498,29 @@ static int open_transport(adapter_transport *dev, const char *node)
     log_line("  adapter USB bulk EP 0x04: max packet %u, max buffer %u",
              dev->endpoint_max_packet_length,
              dev->endpoint_max_bufsize);
+
+    memset(&endpoint, 0, sizeof endpoint);
+    endpoint.max_bufsize = sizeof dev->input_buffers[0];
+    endpoint.max_frames = 1;
+    endpoint.ep_index = XBOX_ADAPTER_EP_IN_CMD_INDEX;
+    endpoint.ep_no = XBOX_ADAPTER_BULK_IN_CMD;
+    set_operation(dev, "opening USB bulk IN endpoint 0x85");
+    if (ioctl(dev->fd, USB_FS_OPEN, &endpoint) != 0)
+        return log_ioctl_failure(dev, "USB_FS_OPEN");
+    log_line("  adapter USB bulk IN EP 0x85: max packet %u, max buffer %u",
+             endpoint.max_packet_length, endpoint.max_bufsize);
+
+    memset(&endpoint, 0, sizeof endpoint);
+    endpoint.max_bufsize = sizeof dev->input_buffers[1];
+    endpoint.max_frames = 1;
+    endpoint.ep_index = XBOX_ADAPTER_EP_IN_WLAN_INDEX;
+    endpoint.ep_no = XBOX_ADAPTER_BULK_IN_WLAN;
+    set_operation(dev, "opening USB bulk IN endpoint 0x84");
+    if (ioctl(dev->fd, USB_FS_OPEN, &endpoint) != 0)
+        return log_ioctl_failure(dev, "USB_FS_OPEN");
+    log_line("  adapter USB bulk IN EP 0x84: max packet %u, max buffer %u",
+             endpoint.max_packet_length, endpoint.max_bufsize);
+
     return 1;
 }
 
