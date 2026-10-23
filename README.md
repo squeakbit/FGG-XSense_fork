@@ -118,6 +118,11 @@ transport; it does not expose the controller as a GIP USB interface. Wireless
 support requires adapter firmware loading, radio initialization, pairing, and
 forwarding the received controller packets into the GIP input path.
 
+When the locally supplied `FW_ACC_00U.bin` is present in the project root,
+the build verifies its SHA-256 and embeds it in the payload. The firmware is
+ignored by Git and is not included in source releases. This only prepares the
+firmware for the adapter driver; it does not enable wireless support by itself.
+
 Developed and verified against a GameSir pad (`3537:1010`) on firmware
 **11.60**.
 

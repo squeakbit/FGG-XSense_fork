@@ -3,6 +3,7 @@ build/
 *.elf
 *.o
 *.a
+FW_ACC_00U.bin
 
 # Editor and OS noise
 .vscode/

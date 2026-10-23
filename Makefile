@@ -23,6 +23,11 @@ CFLAGS := -std=c11 -Wall -Wextra -Werror -O2 -Isrc
 SRCS := src/main.c src/gip.c src/vpad.c src/log.c
 OBJS := $(patsubst %.c,$(BUILD)/%.o,$(SRCS))
 
+FIRMWARE := FW_ACC_00U.bin
+ifneq ($(wildcard $(FIRMWARE)),)
+OBJS += $(BUILD)/firmware_blob.o
+endif
+
 .PHONY: all clean test
 
 all: $(ELF)
@@ -32,6 +37,13 @@ $(ELF): $(OBJS)
 
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(BUILD)/firmware_blob.c: $(FIRMWARE) tools/embed_firmware.py
+	@mkdir -p $(dir $@)
+	python3 tools/embed_firmware.py $(FIRMWARE) $@
+
+$(BUILD)/firmware_blob.o: $(BUILD)/firmware_blob.c src/firmware_blob.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 test: $(ELF)
