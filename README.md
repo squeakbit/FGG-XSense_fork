@@ -110,6 +110,14 @@ protocol `D0` — rather than on a list of vendor IDs, so a controller nobody ha
 tested is still recognised. Nothing that fails to match is opened, configured or
 claimed.
 
+### Xbox Wireless Adapter
+
+The Xbox Wireless Adapter (`045E:02FE`) is detected and reported in the log, but
+is **not supported yet**. The adapter uses a separate MediaTek-based wireless
+transport; it does not expose the controller as a GIP USB interface. Wireless
+support requires adapter firmware loading, radio initialization, pairing, and
+forwarding the received controller packets into the GIP input path.
+
 Developed and verified against a GameSir pad (`3537:1010`) on firmware
 **11.60**.
 

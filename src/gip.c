@@ -19,6 +19,10 @@
 #define GIP_IFACE_SUBCLASS 0x47
 #define GIP_IFACE_PROTOCOL 0xD0
 
+/* Microsoft Xbox Wireless Adapter (wireless transport, not a GIP USB pad). */
+#define XBOX_WIRELESS_VID 0x045E
+#define XBOX_WIRELESS_PID 0x02FE
+
 #define XFER_BUF 256
 #define EP_IN    0
 #define EP_OUT   1
@@ -351,6 +355,7 @@ gip_device *gip_open(char *why, int whylen)
 {
     gip_device *dev = &g_dev;
     unsigned char cfg[1024];
+    char wireless_node[64] = "";
     int bus, unit, found = 0, cfg_len = 0;
 
     memset(dev, 0, sizeof *dev);
@@ -372,6 +377,10 @@ gip_device *gip_open(char *why, int whylen)
             dev->vendor = word((const unsigned char *)&dd.idVendor);
             dev->product = word((const unsigned char *)&dd.idProduct);
             log_line("  USB %s %04X:%04X", dev->node, dev->vendor, dev->product);
+            if (dev->vendor == XBOX_WIRELESS_VID &&
+                dev->product == XBOX_WIRELESS_PID) {
+                snprintf(wireless_node, sizeof wireless_node, "%s", dev->node);
+            }
 
             if (!read_descriptors(fd, cfg, (int)sizeof cfg, &cfg_len)) {
                 log_line("  USB %s: cannot read configuration descriptors: %s",
@@ -393,7 +402,15 @@ gip_device *gip_open(char *why, int whylen)
     }
 
     if (!found) {
-        snprintf(why, (size_t)whylen, "no Xbox-protocol controller connected");
+        if (wireless_node[0] != '\0') {
+            snprintf(why, (size_t)whylen,
+                     "Xbox Wireless Adapter detected at %s; wireless adapter "
+                     "support is not implemented yet",
+                     wireless_node);
+        } else {
+            snprintf(why, (size_t)whylen,
+                     "no Xbox-protocol controller connected");
+        }
         return NULL;
     }
 
