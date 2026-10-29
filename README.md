@@ -113,10 +113,23 @@ claimed.
 ### Xbox Wireless Adapter
 
 The Xbox Wireless Adapter (`045E:02FE`) is detected. With the local firmware
-file present, the payload now attempts to upload the adapter firmware over USB.
-This is only the first initialization stage: radio setup, pairing, and
-forwarding controller packets into the GIP input path are **not implemented**,
-so the controller will not yet work wirelessly.
+file present, the payload uploads the adapter firmware and attempts the MT76
+radio initialization, calibration, and channel-selection sequence used by
+xone. It starts with the normal beacon; an adapter pairing-button event
+switches to the pairing beacon. It polls both bulk IN endpoints and handles
+wireless association and GIP announce/identify. Outgoing GIP commands carry the
+assigned wireless client ID, and each GIP announce is answered with an
+identify request using a nonzero sequence number, as required by xone. Current
+logs show association loss/retries and repeated GIP announce packets. The MT76
+RX path accounts for the two-byte L2 padding before applying the MPDU length,
+and TX places the GIP message after both the QoS control field and MT76 L2
+padding. Input delivery still requires hardware verification. The virtual pad
+is registered after a controller announce, before input arrives, so the PS5
+can present profile selection only after a wireless connection attempt. The
+pairing and report path has not been verified on PS5 hardware; wireless
+controller support is still experimental.
+The MT76 TXWI is 20 bytes; beacon and data frames are laid out after the full
+descriptor, including the pairing beacon's 88-byte USB command transfer.
 
 When the locally supplied `FW_ACC_00U.bin` is present in the project root,
 the build verifies its SHA-256 and embeds it in the payload. The firmware is
@@ -130,7 +143,11 @@ logged and drained while waiting for bulk OUT. This diagnostic path performs
 the normal firmware upload; it does not send additional test payloads. If the
 initial adapter register read fails, it also probes the standard USB device
 descriptor to distinguish a general control-endpoint problem from a
-vendor-request issue.
+vendor-request issue. Register accesses use the MT76 multi-read/write requests
+for ordinary registers and the CFG requests for DMA/configuration registers.
+The radio commands use the adapter's bulk OUT endpoint. Successful USB
+transmission confirms only that USB accepted the data; it does not confirm
+that the radio initialized or that the pairing beacon is active.
 
 For USB troubleshooting without attempting a firmware upload, build the
 separate read-only diagnostic payload with `make adapter-diagnostic`. It reads

@@ -71,6 +71,7 @@ void gip_close(gip_device *dev);
 const char *gip_node(const gip_device *dev);
 unsigned    gip_vendor(const gip_device *dev);
 unsigned    gip_product(const gip_device *dev);
+int         gip_is_wireless_adapter(const gip_device *dev);
 
 /* Collects the next message, if one has arrived.
  *

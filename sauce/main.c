@@ -15,6 +15,7 @@
 #include "gip.h"
 #include "log.h"
 #include "vpad.h"
+#include "xbox_adapter.h"
 
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -99,12 +100,14 @@ typedef struct {
 
 /* Returns when the controller is unplugged, the quit combination is held, or
  * the connection cannot be recovered. */
-static void run(gip_device *dev, vpad *pad, stats *st)
+static void run(gip_device *dev, vpad **pad_ref, stats *st)
 {
     unsigned char report[VPAD_REPORT_SIZE];
     time_t last_input, last_reinit, last_keepalive, last_note;
     time_t last_beat = 0, quit_since = 0;
     int since_input = 0;
+    int wireless_adapter = gip_is_wireless_adapter(dev);
+    vpad *pad = *pad_ref;
 
     last_input = last_reinit = last_keepalive = last_note = time(NULL);
 
@@ -112,6 +115,23 @@ static void run(gip_device *dev, vpad *pad, stats *st)
         const unsigned char *msg = NULL;
         time_t now;
         int n = gip_read(dev, &msg);
+
+        if (wireless_adapter && pad == NULL &&
+            xbox_adapter_controller_connected()) {
+            char why[160];
+
+            pad = vpad_open(VPAD_USER, why, (int)sizeof why);
+            if (pad == NULL) {
+                log_line("  could not register a virtual pad after wireless "
+                         "GIP announce -- %s", why);
+                notify("FGG-XSense: could not register a virtual pad");
+                return;
+            }
+            *pad_ref = pad;
+            log_line("  virtual pad registered after wireless controller "
+                     "announce, %s", why);
+            notify("FGG-XSense: wireless controller connected");
+        }
 
         if (n < 0) {
             /* Back off briefly so a refused transfer does not spin the CPU. */
@@ -147,6 +167,23 @@ static void run(gip_device *dev, vpad *pad, stats *st)
                     quit_since = 0;
                 }
 
+                if (pad == NULL) {
+                    char why[160];
+
+                    pad = vpad_open(VPAD_USER, why, (int)sizeof why);
+                    if (pad == NULL) {
+                        log_line("  could not register a virtual pad after "
+                                 "wireless controller input arrived -- %s",
+                                 why);
+                        notify("FGG-XSense: could not register a virtual pad");
+                        return;
+                    }
+                    *pad_ref = pad;
+                    log_line("  virtual pad registered after first wireless "
+                             "controller input, %s", why);
+                    notify("FGG-XSense: wireless controller connected");
+                }
+
                 vpad_translate(msg, report);
                 if (vpad_submit(pad, report)) st->delivered++;
             }
@@ -162,12 +199,12 @@ static void run(gip_device *dev, vpad *pad, stats *st)
             lock_refresh();
         }
 
-        if (now - last_keepalive >= KEEPALIVE_SECONDS) {
+        if (!wireless_adapter && now - last_keepalive >= KEEPALIVE_SECONDS) {
             last_keepalive = now;
             gip_init(dev);
         }
 
-        if (now - last_input >= REINIT_SECONDS &&
+        if (!wireless_adapter && now - last_input >= REINIT_SECONDS &&
             now - last_reinit >= REINIT_SECONDS) {
             last_reinit = last_keepalive = now;
             st->reinits++;
@@ -184,7 +221,7 @@ static void run(gip_device *dev, vpad *pad, stats *st)
             }
         }
 
-        if (now - last_input >= UNPLUG_SECONDS) {
+        if (!wireless_adapter && now - last_input >= UNPLUG_SECONDS) {
             log_line("  no input for %d seconds -- controller gone",
                      UNPLUG_SECONDS);
             return;
@@ -235,18 +272,24 @@ int main(void)
     log_line("  controller %s  %04X:%04X  %s",
              gip_node(dev), gip_vendor(dev), gip_product(dev), why);
 
-    pad = vpad_open(VPAD_USER, why, (int)sizeof why);
-    if (!pad) {
-        log_line("  could not register a virtual pad -- %s", why);
-        notify("FGG-XSense: could not register a virtual pad");
-        goto done;
+    if (gip_is_wireless_adapter(dev)) {
+        notify("FGG-XSense: adapter ready - pair the controller now");
+        log_line("  waiting for wireless controller announce before "
+                 "registering "
+                 "a virtual pad");
+    } else {
+        pad = vpad_open(VPAD_USER, why, (int)sizeof why);
+        if (!pad) {
+            log_line("  could not register a virtual pad -- %s", why);
+            notify("FGG-XSense: could not register a virtual pad");
+            goto done;
+        }
+        log_line("  virtual pad registered, %s", why);
+        notify("FGG-XSense: controller ready - hold View+Menu to stop");
+        log_line("  running -- unplug the controller or hold View+Menu to stop");
     }
-    log_line("  virtual pad registered, %s", why);
 
-    notify("FGG-XSense: controller ready - hold View+Menu to stop");
-    log_line("  running -- unplug the controller or hold View+Menu to stop");
-
-    run(dev, pad, &st);
+    run(dev, &pad, &st);
 
     log_line("  total: %ld read, %ld delivered, %ld failed, %ld acked, "
              "%d reinit(s), %d rebuild(s)",

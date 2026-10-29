@@ -42,6 +42,7 @@ struct gip_device {
     int  fd;
     char node[64];
     unsigned vendor, product;
+    int wireless_adapter;
 
     int iface, ep_in, ep_out, mps_in;
     int seq;
@@ -199,6 +200,18 @@ static int gip_send(gip_device *dev, unsigned char cmd, unsigned char seq,
 {
     unsigned char *p = dev->data[EP_OUT];
 
+    if (dev->wireless_adapter) {
+        unsigned char message[4 + XFER_BUF - 4];
+
+        if (plen < 0 || plen > (int)sizeof message - 4) return 0;
+        message[0] = cmd;
+        message[1] = GIP_OPT_SYSTEM;
+        message[2] = seq;
+        message[3] = (unsigned char)plen;
+        if (plen > 0) memcpy(message + 4, payload, (size_t)plen);
+        return xbox_adapter_send_gip(message, (size_t)(4 + plen));
+    }
+
     if (dev->ep_out < 0) return 0;
 
     /* Dropping a message whose predecessor is still in flight is safe: every
@@ -252,6 +265,7 @@ void gip_init(gip_device *dev)
     static const unsigned char led_on[]   = { GIP_LED_GUIDE, GIP_LED_GUIDE_ON,
                                               GIP_LED_LEVEL };
 
+    if (dev->wireless_adapter) return;
     gip_send_sync(dev, GIP_CMD_SET_DEVICE_STATE, power_on, (int)sizeof power_on);
     gip_send_sync(dev, GIP_CMD_AUTHENTICATE, auth, (int)sizeof auth);
     gip_send_sync(dev, GIP_CMD_LED, led_on, (int)sizeof led_on);
@@ -276,6 +290,8 @@ int gip_read(gip_device *dev, const unsigned char **msg)
 {
     int n;
 
+    if (dev->wireless_adapter)
+        return xbox_adapter_read(msg);
     fs_start(dev, EP_IN, dev->mps_in ? dev->mps_in : 64);
     n = fs_poll(dev);
     if (n > 0) *msg = dev->data[EP_IN];
@@ -415,8 +431,16 @@ gip_device *gip_open(char *why, int whylen)
 #else
             log_line("  Xbox Wireless Adapter at %s: loading firmware",
                      wireless_node);
-            xbox_adapter_load_firmware(wireless_node, adapter_why,
-                                       sizeof adapter_why);
+            if (xbox_adapter_open(wireless_node, adapter_why,
+                                  sizeof adapter_why)) {
+                dev->fd = -1;
+                dev->wireless_adapter = 1;
+                dev->vendor = XBOX_WIRELESS_VID;
+                dev->product = XBOX_WIRELESS_PID;
+                snprintf(dev->node, sizeof dev->node, "%s", wireless_node);
+                snprintf(why, (size_t)whylen, "%s", adapter_why);
+                return dev;
+            }
 #endif
             snprintf(why, (size_t)whylen, "%s: %s",
                      wireless_node, adapter_why);
@@ -452,6 +476,7 @@ int gip_rebuild(gip_device *dev)
 {
     struct usb_fs_uninit un;
 
+    if (dev->wireless_adapter) return 0;
     memset(&un, 0, sizeof un);
     ioctl(dev->fd, USB_FS_UNINIT, &un);
     close(dev->fd);
@@ -466,6 +491,11 @@ void gip_close(gip_device *dev)
 {
     struct usb_fs_uninit un;
 
+    if (dev && dev->wireless_adapter) {
+        xbox_adapter_close();
+        dev->wireless_adapter = 0;
+        return;
+    }
     if (!dev || dev->fd < 0) return;
 
     memset(&un, 0, sizeof un);
@@ -477,3 +507,7 @@ void gip_close(gip_device *dev)
 const char *gip_node(const gip_device *dev)    { return dev->node; }
 unsigned    gip_vendor(const gip_device *dev)  { return dev->vendor; }
 unsigned    gip_product(const gip_device *dev) { return dev->product; }
+int gip_is_wireless_adapter(const gip_device *dev)
+{
+    return dev != NULL && dev->wireless_adapter;
+}
