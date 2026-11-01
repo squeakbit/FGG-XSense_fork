@@ -140,6 +140,8 @@ static void run(gip_device *dev, vpad **pad_ref, stats *st)
         } else if (n == 0) {
             usleep(1000);
         } else if (n >= 4) {
+            const unsigned char *payload;
+            size_t payload_length;
             last_input = time(NULL);
             since_input = 0;
 
@@ -151,8 +153,12 @@ static void run(gip_device *dev, vpad **pad_ref, stats *st)
                 st->acked++;
             }
 
-            if (msg[0] == GIP_LL_INPUT_REPORT && n >= 4 + 14) {
-                unsigned buttons = (unsigned)msg[4] | ((unsigned)msg[5] << 8);
+            if (msg[0] == GIP_LL_INPUT_REPORT &&
+                gip_message_payload(msg, (size_t)n, &payload,
+                                    &payload_length) &&
+                payload_length >= 14) {
+                unsigned buttons = (unsigned)payload[0] |
+                                   ((unsigned)payload[1] << 8);
 
                 st->reports++;
 
@@ -184,7 +190,7 @@ static void run(gip_device *dev, vpad **pad_ref, stats *st)
                     notify("FGG-XSense: wireless controller connected");
                 }
 
-                vpad_translate(msg, report);
+                vpad_translate(payload, report);
                 if (vpad_submit(pad, report)) st->delivered++;
             }
         }

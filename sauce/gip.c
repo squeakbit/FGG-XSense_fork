@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -35,8 +36,22 @@
 #define GIP_LED_GUIDE_ON 0x01
 #define GIP_LED_LEVEL    0x14
 
+#define GIP_OPT_CHUNK_START 0x40
+#define GIP_OPT_CHUNK       0x80
+#define GIP_MAX_PACKET      65535
+
 /* How long gip_init waits for each write to land, in milliseconds. */
 #define SEND_TIMEOUT_MS 200
+
+struct gip_chunk_state {
+    unsigned char *packet;
+    size_t total;
+    size_t received;
+    unsigned char command;
+    unsigned char options;
+    unsigned char sequence;
+    int active;
+};
 
 struct gip_device {
     int  fd;
@@ -46,19 +61,123 @@ struct gip_device {
 
     int iface, ep_in, ep_out, mps_in;
     int seq;
+    int wireless_identified;
+    int wireless_initialized;
 
     struct usb_fs_endpoint eps[EP_MAX];
     void     *bufptr[EP_MAX][1];
     uint32_t  buflen[EP_MAX][1];
     unsigned char data[EP_MAX][XFER_BUF];
     int pending[EP_MAX];
+
+    struct gip_chunk_state chunk;
 };
 
 static gip_device g_dev;
 
+struct gip_header {
+    unsigned char command;
+    unsigned char options;
+    unsigned char sequence;
+    size_t header_length;
+    size_t packet_length;
+    size_t chunk_offset;
+};
+
 static unsigned word(const unsigned char *p)
 {
     return (unsigned)p[0] | ((unsigned)p[1] << 8);
+}
+
+static int gip_decode_varint(const unsigned char *msg, size_t length,
+                             size_t *cursor, size_t *value)
+{
+    uint32_t result = 0;
+    unsigned shift = 0;
+    unsigned count;
+
+    for (count = 0; count < 5; count++) {
+        unsigned char byte;
+
+        if (*cursor >= length) return 0;
+        byte = msg[(*cursor)++];
+        if (count == 4 && (byte & 0xf0u) != 0) return 0;
+        result |= (uint32_t)(byte & 0x7fu) << shift;
+        if ((byte & 0x80u) == 0) {
+            *value = (size_t)result;
+            return 1;
+        }
+        shift += 7;
+    }
+
+    return 0;
+}
+
+static int gip_parse_header(const unsigned char *msg, size_t length,
+                            struct gip_header *header)
+{
+    size_t cursor = 3;
+
+    if (msg == NULL || header == NULL || length < 4) return 0;
+
+    header->command = msg[0];
+    header->options = msg[1];
+    header->sequence = msg[2];
+    if (!gip_decode_varint(msg, length, &cursor, &header->packet_length))
+        return 0;
+    header->chunk_offset = 0;
+    if ((header->options & GIP_OPT_CHUNK) != 0 &&
+        !gip_decode_varint(msg, length, &cursor, &header->chunk_offset))
+        return 0;
+    if (header->packet_length > length - cursor) return 0;
+
+    header->header_length = cursor;
+    return 1;
+}
+
+int gip_message_payload(const unsigned char *msg, size_t length,
+                        const unsigned char **payload, size_t *payload_length)
+{
+    struct gip_header header;
+
+    if (payload == NULL || payload_length == NULL ||
+        !gip_parse_header(msg, length, &header))
+        return 0;
+
+    *payload = msg + header.header_length;
+    *payload_length = header.packet_length;
+    return 1;
+}
+
+static size_t gip_encode_header(unsigned char *msg, unsigned char command,
+                                unsigned char options, unsigned char sequence,
+                                size_t packet_length)
+{
+    size_t cursor = 3;
+    size_t remaining = packet_length;
+
+    msg[0] = command;
+    msg[1] = options;
+    msg[2] = sequence;
+    do {
+        unsigned char byte = (unsigned char)(remaining & 0x7fu);
+        remaining >>= 7;
+        if (remaining != 0) byte |= 0x80u;
+        msg[cursor++] = byte;
+    } while (remaining != 0);
+
+    if ((cursor & 1u) != 0) {
+        msg[cursor - 1] |= 0x80u;
+        msg[cursor++] = 0;
+    }
+
+    return cursor;
+}
+
+static void gip_clear_chunk(struct gip_chunk_state *chunk)
+{
+    free(chunk->packet);
+    memset(chunk, 0, sizeof *chunk);
 }
 
 /* ---- descriptors ------------------------------------------------------- */
@@ -265,7 +384,23 @@ void gip_init(gip_device *dev)
     static const unsigned char led_on[]   = { GIP_LED_GUIDE, GIP_LED_GUIDE_ON,
                                               GIP_LED_LEVEL };
 
-    if (dev->wireless_adapter) return;
+    if (dev->wireless_adapter) {
+        if (!dev->wireless_identified || dev->wireless_initialized) return;
+        if (!gip_send(dev, GIP_CMD_SET_DEVICE_STATE,
+                      (unsigned char)dev->seq++, power_on,
+                      (int)sizeof power_on)) {
+            log_line("  failed to send wireless GIP power-on command");
+            return;
+        }
+        if (!gip_send(dev, GIP_CMD_LED, (unsigned char)dev->seq++,
+                      led_on, (int)sizeof led_on)) {
+            log_line("  failed to send wireless GIP LED command");
+            return;
+        }
+        dev->wireless_initialized = 1;
+        log_line("  wireless GIP power-on and LED initialization sent");
+        return;
+    }
     gip_send_sync(dev, GIP_CMD_SET_DEVICE_STATE, power_on, (int)sizeof power_on);
     gip_send_sync(dev, GIP_CMD_AUTHENTICATE, auth, (int)sizeof auth);
     gip_send_sync(dev, GIP_CMD_LED, led_on, (int)sizeof led_on);
@@ -280,21 +415,206 @@ void gip_acknowledge(gip_device *dev, const unsigned char *msg)
      * Linux xpad sends in xpadone_ack_mode_report. */
     memset(body, 0, sizeof body);
     body[1] = msg[0];
-    body[2] = msg[1];
+    body[2] = GIP_OPT_SYSTEM;
     body[3] = msg[3];
 
     gip_send(dev, GIP_CMD_ACK, msg[2], body, (int)sizeof body);
 }
 
+static int gip_acknowledge_chunk(gip_device *dev,
+                                 const struct gip_header *header,
+                                 size_t offset, size_t total)
+{
+    unsigned char body[9];
+    size_t acknowledged = offset + header->packet_length;
+
+    if (acknowledged > total || acknowledged > 0xffffu) return 0;
+
+    memset(body, 0, sizeof body);
+    body[1] = header->command;
+    body[2] = GIP_OPT_SYSTEM;
+    body[3] = (unsigned char)(acknowledged & 0xffu);
+    body[4] = (unsigned char)((acknowledged >> 8) & 0xffu);
+    body[7] = (unsigned char)((total - acknowledged) & 0xffu);
+    body[8] = (unsigned char)(((total - acknowledged) >> 8) & 0xffu);
+
+    return gip_send(dev, GIP_CMD_ACK, header->sequence, body, (int)sizeof body);
+}
+
+static int gip_process_chunk(gip_device *dev, const unsigned char *msg,
+                             int length, const unsigned char **complete_msg)
+{
+    struct gip_header header;
+    struct gip_chunk_state *chunk = &dev->chunk;
+    size_t offset, total;
+
+    if (!gip_parse_header(msg, (size_t)length, &header) ||
+        (header.options & GIP_OPT_CHUNK) == 0) {
+        log_line("  invalid wireless GIP chunk header");
+        gip_clear_chunk(chunk);
+        return -1;
+    }
+
+    if ((header.options & GIP_OPT_CHUNK_START) != 0) {
+        total = header.chunk_offset;
+        if (total == 0 || total > GIP_MAX_PACKET ||
+            header.packet_length > total) {
+            log_line("  invalid wireless GIP chunk size %u",
+                     (unsigned)total);
+            gip_clear_chunk(chunk);
+            return -1;
+        }
+
+        if (chunk->active && chunk->packet != NULL &&
+            chunk->command == header.command &&
+            chunk->sequence == header.sequence &&
+            chunk->total == total &&
+            chunk->received >= header.packet_length &&
+            memcmp(chunk->packet + 6, msg + header.header_length,
+                   header.packet_length) == 0) {
+            if ((header.options & GIP_OPT_ACK) != 0 &&
+                !gip_acknowledge_chunk(dev, &header, 0, total)) {
+                log_line("  failed to acknowledge duplicate wireless GIP "
+                         "start chunk");
+                return -1;
+            }
+            return 0;
+        }
+
+        gip_clear_chunk(chunk);
+        chunk->packet = malloc(total + 6);
+        if (chunk->packet == NULL) {
+            log_line("  could not allocate %u bytes for wireless GIP chunks",
+                     (unsigned)(total + 6));
+            return -1;
+        }
+        chunk->active = 1;
+        chunk->total = total;
+        chunk->command = header.command;
+        chunk->options = header.options;
+        chunk->sequence = header.sequence;
+        offset = 0;
+    } else {
+        if (!chunk->active || chunk->packet == NULL ||
+            chunk->command != header.command ||
+            chunk->sequence != header.sequence) {
+            log_line("  wireless GIP chunk arrived without a matching start");
+            return -1;
+        }
+        total = chunk->total;
+        offset = header.chunk_offset;
+    }
+
+    if (offset > total || header.packet_length > total - offset) {
+        log_line("  wireless GIP chunk exceeds message bounds "
+                 "(offset %u, length %u, total %u)",
+                 (unsigned)offset, (unsigned)header.packet_length,
+                 (unsigned)total);
+        return -1;
+    }
+
+    if (offset < chunk->received) {
+        if (header.packet_length <= chunk->received - offset &&
+            memcmp(chunk->packet + 6 + offset,
+                   msg + header.header_length,
+                   header.packet_length) == 0) {
+            if ((header.options & GIP_OPT_ACK) != 0 &&
+                !gip_acknowledge_chunk(dev, &header, offset, total)) {
+                log_line("  failed to acknowledge duplicate wireless GIP "
+                         "chunk");
+                return -1;
+            }
+            return 0;
+        }
+        log_line("  conflicting duplicate wireless GIP chunk at %u",
+                 (unsigned)offset);
+        return -1;
+    }
+
+    if (offset != chunk->received) {
+        log_line("  out-of-order wireless GIP chunk at %u (expected %u)",
+                 (unsigned)offset, (unsigned)chunk->received);
+        return 0;
+    }
+
+    if ((header.options & GIP_OPT_ACK) != 0 &&
+        !gip_acknowledge_chunk(dev, &header, offset, total)) {
+        log_line("  failed to acknowledge wireless GIP chunk");
+        gip_clear_chunk(chunk);
+        return -1;
+    }
+
+    if (header.packet_length > 0) {
+        memcpy(chunk->packet + 6 + offset,
+               msg + header.header_length, header.packet_length);
+        chunk->received += header.packet_length;
+        return 0;
+    }
+
+    if (chunk->received != total) {
+        log_line("  incomplete wireless GIP message: received %u of %u bytes",
+                 (unsigned)chunk->received, (unsigned)total);
+        gip_clear_chunk(chunk);
+        return -1;
+    }
+
+    {
+        size_t header_length;
+        unsigned char encoded_header[6];
+        unsigned char options = chunk->options &
+            (unsigned char)~(GIP_OPT_ACK | GIP_OPT_CHUNK_START | GIP_OPT_CHUNK);
+
+        header_length = gip_encode_header(encoded_header, chunk->command,
+                                          options, chunk->sequence, total);
+        if (header_length > 6) {
+            log_line("  wireless GIP message header exceeded its buffer");
+            gip_clear_chunk(chunk);
+            return -1;
+        }
+        memmove(chunk->packet + header_length, chunk->packet + 6, total);
+        memcpy(chunk->packet, encoded_header, header_length);
+        *complete_msg = chunk->packet;
+        chunk->active = 0;
+        log_line("  wireless GIP message reassembled: command 0x%02x, "
+                 "%u payload byte(s)",
+                 chunk->command, (unsigned)total);
+        return (int)(header_length + total);
+    }
+}
+
 int gip_read(gip_device *dev, const unsigned char **msg)
 {
+    struct gip_header header;
     int n;
 
-    if (dev->wireless_adapter)
-        return xbox_adapter_read(msg);
-    fs_start(dev, EP_IN, dev->mps_in ? dev->mps_in : 64);
-    n = fs_poll(dev);
-    if (n > 0) *msg = dev->data[EP_IN];
+    if (dev->wireless_adapter) {
+        n = xbox_adapter_read(msg);
+    } else {
+        fs_start(dev, EP_IN, dev->mps_in ? dev->mps_in : 64);
+        n = fs_poll(dev);
+        if (n > 0) *msg = dev->data[EP_IN];
+    }
+
+    if (n <= 0) return n;
+    if (!gip_parse_header(*msg, (size_t)n, &header)) {
+        log_line("  malformed GIP message received (%u bytes)", (unsigned)n);
+        return -1;
+    }
+    if ((header.options & GIP_OPT_CHUNK) != 0) {
+        n = gip_process_chunk(dev, *msg, n, msg);
+        if (n > 0 && (*msg)[0] == GIP_CMD_IDENTIFY &&
+            dev->wireless_adapter) {
+            dev->wireless_identified = 1;
+            gip_init(dev);
+        }
+        return n;
+    }
+
+    if (header.command == GIP_CMD_IDENTIFY && dev->wireless_adapter) {
+        dev->wireless_identified = 1;
+        gip_init(dev);
+    }
+
     return n;
 }
 
@@ -491,12 +811,15 @@ void gip_close(gip_device *dev)
 {
     struct usb_fs_uninit un;
 
+    if (!dev) return;
+    gip_clear_chunk(&dev->chunk);
+
     if (dev && dev->wireless_adapter) {
         xbox_adapter_close();
         dev->wireless_adapter = 0;
         return;
     }
-    if (!dev || dev->fd < 0) return;
+    if (dev->fd < 0) return;
 
     memset(&un, 0, sizeof un);
     ioctl(dev->fd, USB_FS_UNINIT, &un);

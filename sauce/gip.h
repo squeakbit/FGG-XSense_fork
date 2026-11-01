@@ -15,10 +15,12 @@
 #ifndef FGG_GIP_H
 #define FGG_GIP_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* Message types. Only the ones this program acts on are named. */
 #define GIP_CMD_ACK              0x01
+#define GIP_CMD_IDENTIFY         0x04
 #define GIP_CMD_SET_DEVICE_STATE 0x05
 #define GIP_CMD_AUTHENTICATE     0x06
 #define GIP_CMD_GUIDE_BUTTON     0x07
@@ -82,6 +84,11 @@ int         gip_is_wireless_adapter(const gip_device *dev);
  * sustained silence indicates a real problem.
  */
 int gip_read(gip_device *dev, const unsigned char **msg);
+
+/* Extracts the payload from a complete GIP message, including extended
+ * headers used for longer messages. */
+int gip_message_payload(const unsigned char *msg, size_t length,
+                        const unsigned char **payload, size_t *payload_length);
 
 /* Acknowledges a message whose options byte had GIP_OPT_ACK set. The
  * controller waits for this and stops talking to a host that ignores it. */

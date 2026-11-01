@@ -40,6 +40,6 @@ int vpad_submit(vpad *pad, const unsigned char *report);
  */
 #define VPAD_REPORT_SIZE 0xA0
 
-void vpad_translate(const unsigned char *gip_report, unsigned char *report);
+void vpad_translate(const unsigned char *gip_payload, unsigned char *report);
 
 #endif

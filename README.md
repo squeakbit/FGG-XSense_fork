@@ -118,13 +118,21 @@ radio initialization, calibration, and channel-selection sequence used by
 xone. It starts with the normal beacon; an adapter pairing-button event
 switches to the pairing beacon. It polls both bulk IN endpoints and handles
 wireless association and GIP announce/identify. Outgoing GIP commands carry the
-assigned wireless client ID, and each GIP announce is answered with an
-identify request using a nonzero sequence number, as required by xone. Current
-logs show association loss/retries and repeated GIP announce packets. The MT76
-RX path accounts for the two-byte L2 padding before applying the MPDU length,
-and TX places the GIP message after both the QoS control field and MT76 L2
-padding. Input delivery still requires hardware verification. The virtual pad
-is registered after a controller announce, before input arrives, so the PS5
+GIP client ID from the controller's announce (separate from its MT76 WCID).
+GIP announces requesting acknowledgement are acknowledged with their original
+sequence number before the identify request is sent, matching xone's receive
+order. Acknowledgement payloads use the host's internal GIP option and assigned
+client ID. GIP chunked messages are reassembled, and chunk acknowledgements
+report the received offset and remaining length; identical retransmitted chunks
+are ignored without discarding the partial message. The identify request uses a
+nonzero sequence number. After the identify response is reassembled, the host
+sends GIP power-on and LED initialization commands. The MT76 RX path accounts
+for the two-byte L2 padding
+before applying the MPDU length,
+and TX inserts the two-byte L2 padding after the QoS control field before the
+GIP message while excluding it from the TXWI's MPDU length, matching xone's
+packet layout. Input delivery still requires hardware verification. The virtual
+pad is registered after a controller announce, before input arrives, so the PS5
 can present profile selection only after a wireless connection attempt. The
 pairing and report path has not been verified on PS5 hardware; wireless
 controller support is still experimental.

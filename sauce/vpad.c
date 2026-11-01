@@ -158,9 +158,9 @@ static int16_t le16(const unsigned char *p)
 static uint8_t axis(int16_t v)     { return (uint8_t)(((int)v + 32768) >> 8); }
 static uint8_t axis_inv(int16_t v) { return (uint8_t)((32767 - (int)v) >> 8); }
 
-void vpad_translate(const unsigned char *gip_report, unsigned char *report)
+void vpad_translate(const unsigned char *gip_payload, unsigned char *report)
 {
-    const unsigned char *d = gip_report + 4;   /* past the message header */
+    const unsigned char *d = gip_payload;
     unsigned m  = (unsigned)d[0] | ((unsigned)d[1] << 8);
     unsigned lt = (unsigned)d[2] | ((unsigned)d[3] << 8);
     unsigned rt = (unsigned)d[4] | ((unsigned)d[5] << 8);

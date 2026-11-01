@@ -172,9 +172,11 @@
 #define MT_MS_SET_MAC_ADDRESS 0u
 #define MT_MS_SET_IDLE_TIME 5u
 #define MT_MS_SET_CHAN_CANDIDATES 7u
+#define MT_GIP_CMD_ACK 0x01u
 #define MT_GIP_CMD_ANNOUNCE 0x02u
 #define MT_GIP_CMD_IDENTIFY 0x04u
 #define MT_GIP_OPT_SYSTEM 0x20u
+#define MT_GIP_OPT_ACK 0x10u
 #define MT_PHY_BW_20 0u
 #define MT_PHY_BW_40 1u
 #define MT_PHY_BW_80 2u
@@ -207,6 +209,8 @@ typedef struct {
     int present;
     int encryption_enabled;
     int gip_announce_seen;
+    unsigned char gip_id;
+    int gip_id_valid;
 } adapter_client;
 
 static adapter_transport adapter;
@@ -221,6 +225,8 @@ static uint16_t adapter_input_lengths[MT_WIFI_INPUT_QUEUE_SIZE];
 static unsigned adapter_input_head, adapter_input_tail, adapter_input_count;
 static unsigned adapter_input_debug_count[2];
 static unsigned adapter_wifi_frame_debug_count;
+static unsigned adapter_gip_rx_debug_count;
+static unsigned adapter_gip_tx_debug_count;
 static unsigned char adapter_gip_sequence = 1;
 
 static void set_operation(adapter_transport *dev, const char *operation)
@@ -1333,13 +1339,21 @@ static int set_pairing_mode(adapter_transport *dev, int enabled)
     return 1;
 }
 
-static int send_gip_command(uint8_t command, const unsigned char *payload,
-                            size_t payload_length)
+static int send_gip_to_client(adapter_transport *dev, size_t client_index,
+                              const unsigned char *message, size_t length);
+
+static int send_gip_command(adapter_transport *dev, uint8_t command,
+                            const unsigned char *payload,
+                            size_t payload_length, uint8_t wcid)
 {
     unsigned char message[7];
 
     if (payload_length > sizeof message - 4u) {
         errno = EMSGSIZE;
+        return 0;
+    }
+    if (wcid == 0 || wcid > MT_WIFI_MAX_CLIENTS) {
+        errno = ENOTCONN;
         return 0;
     }
     message[0] = command;
@@ -1349,7 +1363,98 @@ static int send_gip_command(uint8_t command, const unsigned char *payload,
     message[3] = (unsigned char)payload_length;
     if (payload_length != 0)
         memcpy(message + 4, payload, payload_length);
-    return xbox_adapter_send_gip(message, 4u + payload_length);
+    return send_gip_to_client(dev, (size_t)(wcid - 1), message,
+                              4u + payload_length);
+}
+
+static int send_gip_to_client(adapter_transport *dev, size_t client_index,
+                              const unsigned char *message, size_t length)
+{
+    unsigned char payload[8 + MT_MCU_TXWI_SIZE +
+                          MT_WIFI_HEADER_SIZE +
+                          MT_WIFI_QOS_CONTROL_SIZE +
+                          MT_WIFI_L2_PADDING_SIZE + 512] = { 0 };
+    unsigned char client_message[450];
+    unsigned char *txwi = payload + 8;
+    unsigned char *frame = txwi + MT_MCU_TXWI_SIZE;
+    size_t frame_length;
+    size_t txwi_frame_length;
+
+    if (message == NULL || length < 4 || length > sizeof client_message ||
+        client_index >= MT_WIFI_MAX_CLIENTS) {
+        errno = EINVAL;
+        return 0;
+    }
+    if (!adapter_clients[client_index].present ||
+        !adapter_clients[client_index].gip_id_valid) {
+        errno = ENOTCONN;
+        return 0;
+    }
+
+    frame_length = MT_WIFI_HEADER_SIZE + MT_WIFI_QOS_CONTROL_SIZE +
+                   MT_WIFI_L2_PADDING_SIZE + length;
+    txwi_frame_length = MT_WIFI_HEADER_SIZE + MT_WIFI_QOS_CONTROL_SIZE +
+                        length;
+    payload[2] = 0; /* data queue */
+    payload[3] = (uint8_t)client_index;
+    txwi[0] = 0x80; /* MPDU density */
+    txwi[2] = 0x00;
+    txwi[3] = 0x20; /* OFDM */
+    txwi[4] = MT_MCU_TXWI_ACK_REQUEST;
+    txwi[5] = (uint8_t)client_index;
+    txwi[6] = (unsigned char)txwi_frame_length;
+    txwi[7] = (unsigned char)(txwi_frame_length >> 8);
+    frame[0] = 0x88; /* QoS data */
+    frame[1] = (unsigned char)(0x02 |
+        (adapter_clients[client_index].encryption_enabled ? 0x40 : 0));
+    frame[2] = 0x90; /* duration */
+    memcpy(frame + 4, adapter_clients[client_index].address, 6);
+    memcpy(frame + 10, adapter_address, 6);
+    memcpy(frame + 16, adapter_address, 6);
+    memcpy(client_message, message, length);
+    client_message[1] = (unsigned char)((client_message[1] & 0xf0u) |
+                                        adapter_clients[client_index].gip_id);
+    if (client_message[0] == MT_GIP_CMD_ACK && length >= 13 &&
+        client_message[3] >= 9) {
+        client_message[6] = (unsigned char)(MT_GIP_OPT_SYSTEM |
+            adapter_clients[client_index].gip_id);
+    }
+    if (adapter_gip_tx_debug_count < 16) {
+        log_line("  wireless GIP TX: command 0x%02x, options 0x%02x, "
+                 "sequence %u, length %u, GIP ID %u, WCID %u",
+                 client_message[0], client_message[1], client_message[2],
+                 client_message[3], adapter_clients[client_index].gip_id,
+                 (unsigned)(client_index + 1));
+        adapter_gip_tx_debug_count++;
+    }
+    memcpy(frame + MT_WIFI_HEADER_SIZE + MT_WIFI_QOS_CONTROL_SIZE +
+           MT_WIFI_L2_PADDING_SIZE, client_message, length);
+    return send_mcu_payload(dev, 0, payload,
+                            8 + MT_MCU_TXWI_SIZE + frame_length);
+}
+
+static int send_gip_acknowledgement(adapter_transport *dev, uint8_t wcid,
+                                    const unsigned char *message)
+{
+    unsigned char acknowledgement[4 + 9] = { 0 };
+    unsigned char *payload = acknowledgement + 4;
+
+    if (wcid == 0 || wcid > MT_WIFI_MAX_CLIENTS ||
+        !adapter_clients[wcid - 1].present) {
+        errno = ENOTCONN;
+        return 0;
+    }
+
+    acknowledgement[0] = MT_GIP_CMD_ACK;
+    acknowledgement[1] = MT_GIP_OPT_SYSTEM;
+    acknowledgement[2] = message[2];
+    acknowledgement[3] = 9;
+    payload[1] = message[0];
+    payload[2] = MT_GIP_OPT_SYSTEM;
+    payload[3] = message[3];
+
+    return send_gip_to_client(dev, (size_t)(wcid - 1), acknowledgement,
+                              sizeof acknowledgement);
 }
 
 static int initialize_radio(adapter_transport *dev)
@@ -1391,8 +1496,7 @@ static int initialize_radio(adapter_transport *dev)
     return set_led_mode(dev, 2);
 }
 
-static int send_wlan_frame(adapter_transport *dev, uint8_t wcid,
-                           const unsigned char *address,
+static int send_wlan_frame(adapter_transport *dev, const unsigned char *address,
                            const unsigned char *frame, size_t frame_length)
 {
     unsigned char packet[1024] = { 0 };
@@ -1412,7 +1516,7 @@ static int send_wlan_frame(adapter_transport *dev, uint8_t wcid,
     packet[6] = 0x00;
     packet[7] = 0x20; /* OFDM */
     packet[8] = MT_MCU_TXWI_ACK_REQUEST;
-    packet[9] = wcid == 0 ? 0xff : (uint8_t)(wcid - 1);
+    packet[9] = 0xff; /* management frames are sent without a client WCID */
     packet[10] = (unsigned char)frame_length;
     packet[11] = (unsigned char)(frame_length >> 8);
     if (address != NULL && frame_length >= MT_WIFI_HEADER_SIZE &&
@@ -1478,7 +1582,7 @@ static int send_pair_response(adapter_transport *dev,
     frame[MT_WIFI_HEADER_SIZE] = (unsigned char)MT_WIFI_RESERVED_SUBTYPE;
     frame[MT_WIFI_HEADER_SIZE + 1] = MT_WIFI_CLIENT_PAIR_RESP;
     memcpy(frame + MT_WIFI_HEADER_SIZE + 2, data, sizeof data);
-    return send_wlan_frame(dev, 0, address, frame, sizeof frame);
+    return send_wlan_frame(dev, address, frame, sizeof frame);
 }
 
 static int send_association_response(adapter_transport *dev, uint8_t wcid,
@@ -1504,7 +1608,7 @@ static int send_association_response(adapter_transport *dev, uint8_t wcid,
                           wcid_address, 8) ||
         !send_ms_command(dev, MT_WIFI_CLIENT_ADD, add_client,
                          sizeof add_client) ||
-        !send_wlan_frame(dev, wcid, address, frame, sizeof frame))
+        !send_wlan_frame(dev, address, frame, sizeof frame))
         return 0;
     memcpy(adapter_clients[wcid - 1].address, address, 6);
     adapter_clients[wcid - 1].present = 1;
@@ -1570,7 +1674,12 @@ static int handle_wifi_frame(adapter_transport *dev,
             int first_announce =
                 !adapter_clients[wcid - 1].gip_announce_seen;
 
-            if (!send_gip_command(MT_GIP_CMD_IDENTIFY, NULL, 0))
+            adapter_clients[wcid - 1].gip_id = body[1] & 0x0fu;
+            adapter_clients[wcid - 1].gip_id_valid = 1;
+            if ((body[1] & MT_GIP_OPT_ACK) != 0 &&
+                !send_gip_acknowledgement(dev, wcid, body))
+                return 0;
+            if (!send_gip_command(dev, MT_GIP_CMD_IDENTIFY, NULL, 0, wcid))
                 return 0;
             if (adapter_pairing_enabled) {
                 if (!initialize_beacon(dev, adapter_address, 0) ||
@@ -1587,12 +1696,15 @@ static int handle_wifi_frame(adapter_transport *dev,
                    adapter_clients[wcid - 1].present &&
                    body_length >= 4 &&
                    body_length <= sizeof gip_message) {
-            size_t report_length = (size_t)body[3] + 4;
-            if (report_length <= body_length &&
-                report_length <= sizeof gip_message) {
-                memcpy(gip_message, body, report_length);
-                gip_message_length = report_length;
+            if (adapter_gip_rx_debug_count < 16) {
+                log_line("  wireless GIP RX: command 0x%02x, options 0x%02x, "
+                         "sequence %u, declared %u, frame %u byte(s)",
+                         body[0], body[1], body[2], body[3],
+                         (unsigned)body_length);
+                adapter_gip_rx_debug_count++;
             }
+            memcpy(gip_message, body, body_length);
+            gip_message_length = body_length;
         }
         return 1;
     }
@@ -1750,6 +1862,8 @@ int xbox_adapter_open(const char *node, char *why, size_t whylen)
     memset(adapter_input_debug_count, 0,
            sizeof adapter_input_debug_count);
     adapter_wifi_frame_debug_count = 0;
+    adapter_gip_rx_debug_count = 0;
+    adapter_gip_tx_debug_count = 0;
     gip_message_length = 0;
     if (!open_transport(&adapter, node)) {
         saved_errno = errno;
@@ -1761,6 +1875,8 @@ int xbox_adapter_open(const char *node, char *why, size_t whylen)
         memset(adapter_input_debug_count, 0,
                sizeof adapter_input_debug_count);
         adapter_wifi_frame_debug_count = 0;
+        adapter_gip_rx_debug_count = 0;
+        adapter_gip_tx_debug_count = 0;
         return 0;
     }
 
@@ -1795,6 +1911,8 @@ void xbox_adapter_close(void)
     memset(adapter_input_debug_count, 0,
            sizeof adapter_input_debug_count);
     adapter_wifi_frame_debug_count = 0;
+    adapter_gip_rx_debug_count = 0;
+    adapter_gip_tx_debug_count = 0;
 #endif
 }
 
@@ -1891,47 +2009,8 @@ int xbox_adapter_send_gip(const unsigned char *message, size_t length)
         return 0;
     }
     for (i = 0; i < MT_WIFI_MAX_CLIENTS; i++) {
-        unsigned char payload[8 + MT_MCU_TXWI_SIZE +
-                              MT_WIFI_HEADER_SIZE +
-                              MT_WIFI_QOS_CONTROL_SIZE +
-                              MT_WIFI_L2_PADDING_SIZE + 512] = { 0 };
-        unsigned char client_message[450];
-        unsigned char *txwi = payload + 8;
-        unsigned char *frame = txwi + MT_MCU_TXWI_SIZE;
-        size_t frame_length = MT_WIFI_HEADER_SIZE +
-                              MT_WIFI_QOS_CONTROL_SIZE +
-                              MT_WIFI_L2_PADDING_SIZE + length;
-
-        if (!adapter_clients[i].present) continue;
-        if (i >= 15) {
-            errno = EINVAL;
-            return 0;
-        }
-
-        payload[2] = 0; /* data queue */
-        payload[3] = (uint8_t)i;
-        txwi[0] = 0x80; /* MPDU density */
-        txwi[2] = 0x00;
-        txwi[3] = 0x20; /* OFDM */
-        txwi[4] = MT_MCU_TXWI_ACK_REQUEST;
-        txwi[5] = (uint8_t)i;
-        txwi[6] = (unsigned char)frame_length;
-        txwi[7] = (unsigned char)(frame_length >> 8);
-        frame[0] = 0x88; /* QoS data */
-        frame[1] = (unsigned char)(0x02 |
-            (adapter_clients[i].encryption_enabled ? 0x40 : 0));
-        frame[2] = 0x90; /* duration */
-        memcpy(frame + 4, adapter_clients[i].address, 6);
-        memcpy(frame + 10, adapter_address, 6);
-        memcpy(frame + 16, adapter_address, 6);
-        memcpy(client_message, message, length);
-        client_message[1] = (unsigned char)((client_message[1] & 0xf0u) |
-                                            (i + 1u));
-        memcpy(frame + MT_WIFI_HEADER_SIZE +
-               MT_WIFI_QOS_CONTROL_SIZE + MT_WIFI_L2_PADDING_SIZE,
-               client_message, length);
-        return send_mcu_payload(&adapter, 0, payload,
-                                8 + MT_MCU_TXWI_SIZE + frame_length);
+        if (adapter_clients[i].present && adapter_clients[i].gip_id_valid)
+            return send_gip_to_client(&adapter, i, message, length);
     }
     errno = ENOTCONN;
     return 0;
